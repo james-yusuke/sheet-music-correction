@@ -1,19 +1,24 @@
+import base64
 import io
 import json
 import math
-import re
 import shutil
-import subprocess
 import tempfile
-from pathlib import Path
+from contextlib import closing, contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from threading import Lock
 
 import cv2
 import numpy as np
+import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_raw
 from PIL import Image, UnidentifiedImageError
 
 FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
            ".tif": "TIFF", ".tiff": "TIFF", ".bmp": "BMP", ".webp": "WEBP"}
+# PDFium calls must be serialized even when requests open different documents.
+PDFIUM_LOCK = Lock()
 
 
 def detect(image):
@@ -30,7 +35,8 @@ def detect(image):
     if lines is None:
         return None
     votes = {}
-    for x, y, xx, yy in lines[:, 0]:
+    # OpenCV returns (N, 1, 4) or (N, 4), depending on the version.
+    for x, y, xx, yy in lines.reshape(-1, 4):
         if x == xx:
             continue
         angle = math.degrees(math.atan((yy - y) / (xx - x)))
@@ -107,29 +113,62 @@ def corrected(image, angle, flip, fit, margins=(0, 0, 0, 0)):
     return canvas
 
 
-def poppler(*args):
-    return subprocess.check_output(args, stderr=subprocess.PIPE, timeout=300)
+@contextmanager
+def open_pdf(source):
+    # Python handles paths containing non-ASCII characters on both platforms.
+    with source.open("rb") as stream:
+        with PDFIUM_LOCK:
+            try:
+                document = pdfium.PdfDocument(stream)
+            except pdfium.PdfiumError as exc:
+                if exc.err_code == pdfium_raw.FPDF_ERR_PASSWORD:
+                    raise ValueError("パスワードで保護されたPDFです。保護を解除したPDFを開いてください。") from exc
+                raise ValueError("PDFを読み取れませんでした。元のPDFが開けるか確認してください。") from exc
+        try:
+            with PDFIUM_LOCK:
+                document.init_forms()
+                count = len(document)
+            if count == 0:
+                raise ValueError("PDFにページがありません")
+            yield document, count
+        finally:
+            with PDFIUM_LOCK:
+                document.close()
 
 
-def pdf_dimensions(source):
-    count = pdf_page_count(source)
-    info = poppler("pdfinfo", "-box", "-f", "1", "-l", str(count), str(source)).decode(errors="replace")
-    sizes = re.findall(r"Page\s+\d+\s+size:\s+([\d.]+) x ([\d.]+)", info)
-    rotations = re.findall(r"Page\s+\d+\s+rot:\s+(\d+)", info)
-    crop_boxes = re.findall(r"Page\s+\d+\s+CropBox:\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)", info)
-    if len(sizes) != count or len(rotations) != count:
-        raise ValueError("PDFのページ寸法を取得できませんでした")
-    dimensions = []
-    for index, (w, h) in enumerate(sizes):
-        w, h = float(w), float(h)
-        if len(crop_boxes) == count:
-            left, bottom, right, top = map(float, crop_boxes[index])
-            if right > left and top > bottom:
-                w, h = round(right - left, 2), round(top - bottom, 2)
-        if int(rotations[index]) % 180:
-            w, h = h, w
-        dimensions.append((w, h))
-    return dimensions
+def render_pdf_page(document, index, preview):
+    try:
+        with PDFIUM_LOCK, closing(document[index]) as page:
+            # PDFium reports dimensions with the visible crop and page rotation applied.
+            width, height = page.get_size()
+            if not all(math.isfinite(value) and value > 0 for value in (width, height)):
+                raise ValueError("PDFのページ寸法を取得できませんでした")
+            scale = 3200 / max(width, height) if preview else 300 / 72
+            pixels = math.ceil(width * scale) * math.ceil(height * scale)
+            if Image.MAX_IMAGE_PIXELS is not None and pixels > 2 * Image.MAX_IMAGE_PIXELS:
+                raise ValueError("PDFのページが大きすぎます。縮小したPDFを開いてください。")
+            with closing(page.render(scale=scale, draw_annots=True)) as bitmap:
+                # Detach the image from the bitmap before releasing its buffer.
+                image = bitmap.to_pil().convert("RGB")
+        return image, (width, height)
+    except pdfium.PdfiumError as exc:
+        raise ValueError(f"PDFの{index + 1}ページ目を読み込めませんでした") from exc
+
+
+def read_pages(source, document, count, preview=False):
+    if document is None:
+        yield rgb(source), None
+    else:
+        for index in range(count):
+            yield render_pdf_page(document, index, preview)
+
+
+def analyse_page(image):
+    angle = detect(image)
+    image.thumbnail((2000, 2000))
+    preview = io.BytesIO()
+    image.save(preview, "JPEG", quality=85)
+    return {"angle": angle, "preview": base64.b64encode(preview.getvalue()).decode()}
 
 
 def export_settings(data, count):
@@ -152,36 +191,7 @@ def export_settings(data, count):
         yield angle, flip, fit, margins
 
 
-def pdf_pages(source, folder, dimensions):
-    batch_size = 8
-    for start in range(0, len(dimensions), batch_size):
-        batch = dimensions[start:start + batch_size]
-        poppler("pdftoppm", "-f", str(start + 1), "-l", str(start + len(batch)),
-                "-cropbox", "-r", "300", "-png", str(source), str(folder / "page"))
-        paths = sorted(folder.glob("page-*.png"))
-        if len(paths) != len(batch):
-            raise ValueError("PDFの一部を読み込めませんでした")
-        for path, size in zip(paths, batch):
-            yield path, size
-            path.unlink()
-
-
-def pdf_page_count(source):
-    try:
-        info = poppler("pdfinfo", str(source)).decode(errors="replace")
-    except FileNotFoundError as exc:
-        raise ValueError("PDFを開くにはPopplerのpdfinfoが必要です。起動バッチまたはPATHの設定を確認してください。") from exc
-    except subprocess.CalledProcessError as exc:
-        if b"incorrect password" in (exc.stderr or b"").lower():
-            raise ValueError("パスワードで保護されたPDFです。保護を解除したPDFを開いてください。") from exc
-        raise ValueError("PDFを読み取れませんでした。元のPDFが開けるか確認してください。") from exc
-    match = re.search(r"^Pages:\s+(\d+)", info, re.M)
-    if not match:
-        raise ValueError("PDFのページ数を取得できませんでした")
-    return int(match[1])
-
-
-def write_pdf(output, pages):
+def write_pdf(output, count, pages):
     offsets = [0]
     output.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
 
@@ -193,9 +203,10 @@ def write_pdf(output, pages):
         obj(header + f" /Length {len(data)} >>\nstream\n".encode() + data + b"\nendstream")
 
     obj(b"<< /Type /Catalog /Pages 2 0 R >>")
-    kids = " ".join(f"{3+3*i} 0 R" for i in range(len(pages)))
-    obj(f"<< /Type /Pages /Count {len(pages)} /Kids [{kids}] >>".encode())
-    for index, (image, (w, h)) in enumerate(pages):
+    kids = " ".join(f"{3+3*i} 0 R" for i in range(count))
+    obj(f"<< /Type /Pages /Count {count} /Kids [{kids}] >>".encode())
+    for index, (image, (width, height)) in enumerate(pages):
+        w, h = f"{width:.8f}", f"{height:.8f}"
         base = 3 + 3*index
         obj(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Resources << /XObject << /Scan {base+1} 0 R >> >> /Contents {base+2} 0 R >>".encode())
         jpeg = io.BytesIO()
@@ -247,14 +258,13 @@ class Server(BaseHTTPRequestHandler):
             self.process()
         except ConnectionError:
             return
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        except (ValueError, OSError, pdfium.PdfiumError) as exc:
             try:
                 self.reply(json.dumps({"error": str(exc)}).encode(), "application/json", 400)
             except ConnectionError:
                 return
 
     def process(self):
-        import base64
         size = int(self.headers.get("Content-Length", "0"))
         settings_length = int(self.headers.get("X-Settings-Length", "0"))
         if not 0 <= settings_length <= min(8 * 1024**2, size):
@@ -282,49 +292,46 @@ class Server(BaseHTTPRequestHandler):
             pdf = fmt == ".pdf"
             if not pdf and fmt not in FORMATS:
                 raise ValueError("未対応の形式です")
-            if self.path == "/analyse":
-                if self.headers.get("Accept") == "application/x-ndjson":
-                    self.stream_analysis(source, folder, pdf)
-                    return
-                pages = pdf_pages(source, folder, pdf_dimensions(source)) if pdf else [(source, None)]
-                previews = []
-                for path, _ in pages:
-                    image = rgb(path)
-                    angle = detect(image)
-                    image.thumbnail((2000, 2000))
-                    preview = io.BytesIO()
-                    image.save(preview, "JPEG", quality=85)
-                    previews.append({"angle": angle, "preview": base64.b64encode(preview.getvalue()).decode()})
-                self.reply(json.dumps(previews).encode(), "application/json")
-            elif self.path == "/export":
-                dimensions = pdf_dimensions(source) if pdf else [None]
-                pages = pdf_pages(source, folder, dimensions) if pdf else [(source, None)]
-                settings = list(export_settings(settings_data, len(dimensions)))
-                def images():
-                    for (path, size), (angle, flip, fit, margins) in zip(pages, settings):
-                        yield corrected(rgb(path), angle, flip, fit, margins), size
-                if pdf:
-                    with tempfile.TemporaryFile(dir=folder) as output:
-                        write_pdf(output, _PageStream(len(dimensions), images()))
-                        length = output.tell()
-                        output.seek(0)
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/pdf")
-                        self.send_header("Content-Length", str(length))
-                        self.send_header("Cache-Control", "no-store")
-                        self.end_headers()
-                        shutil.copyfileobj(output, self.wfile, length=256 * 1024)
+            with (open_pdf(source) if pdf else nullcontext((None, 1))) as (document, count):
+                if self.path == "/analyse":
+                    streaming = self.headers.get("Accept") == "application/x-ndjson"
+                    pages = read_pages(source, document, count, preview=streaming)
+                    if streaming:
+                        self.stream_analysis(pages, count)
+                    else:
+                        previews = [analyse_page(image) for image, _ in pages]
+                        self.reply(json.dumps(previews).encode(), "application/json")
+                elif self.path == "/export":
+                    pages = read_pages(source, document, count)
+                    self.export(pages, count, settings_data, fmt, folder)
                 else:
-                    output = io.BytesIO()
-                    image, _ = next(images())
-                    image.save(output, FORMATS[fmt], **({"quality": 95} if fmt in (".jpg", ".jpeg", ".webp") else {}))
-                    self.reply(output.getvalue(), "application/octet-stream")
-            else:
-                self.send_error(404)
+                    self.send_error(404)
 
-    def stream_analysis(self, source, folder, pdf):
-        import base64
-        count = pdf_page_count(source) if pdf else 1
+    def export(self, pages, count, settings_data, fmt, folder):
+        settings = list(export_settings(settings_data, count))
+        images = (
+            (corrected(image, *setting), size)
+            for (image, size), setting in zip(pages, settings)
+        )
+        if fmt == ".pdf":
+            with tempfile.TemporaryFile(dir=folder) as output:
+                write_pdf(output, count, images)
+                length = output.tell()
+                output.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                shutil.copyfileobj(output, self.wfile, length=256 * 1024)
+        else:
+            output = io.BytesIO()
+            image, _ = next(images)
+            options = {"quality": 95} if fmt in (".jpg", ".jpeg", ".webp") else {}
+            image.save(output, FORMATS[fmt], **options)
+            self.reply(output.getvalue(), "application/octet-stream")
+
+    def stream_analysis(self, pages, count):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Cache-Control", "no-store")
@@ -336,36 +343,12 @@ class Server(BaseHTTPRequestHandler):
 
         try:
             send({"total": count})
-            for number in range(1, count + 1):
-                path = source
-                if pdf:
-                    prefix = folder / "preview"
-                    poppler("pdftoppm", "-f", str(number), "-l", str(number),
-                            "-singlefile", "-cropbox", "-scale-to", "3200", "-png",
-                            str(source), str(prefix))
-                    path = prefix.with_suffix(".png")
-                image = rgb(path)
-                angle = detect(image)
-                image.thumbnail((2000, 2000))
-                preview = io.BytesIO()
-                image.save(preview, "JPEG", quality=85)
-                send({"angle": angle, "preview": base64.b64encode(preview.getvalue()).decode()})
+            for image, _ in pages:
+                send(analyse_page(image))
         except ConnectionError:
             return
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        except (ValueError, OSError) as exc:
             send({"error": str(exc)})
-
-
-class _PageStream:
-    def __init__(self, count, images):
-        self.count = count
-        self.images = images
-
-    def __len__(self):
-        return self.count
-
-    def __iter__(self):
-        return self.images
 
 
 if __name__ == "__main__":

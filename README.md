@@ -4,20 +4,33 @@
 
 ## 起動
 
-Python 3.10以上と Poppler の `pdfinfo`・`pdftoppm` が必要です。Poppler の実行ファイルを PATH に追加してください。
+Python 3.10以上が必要です。Windows では x64 版の Python を使ってください。PDF の処理に使うライブラリも `pip` で入ります。
 
-```powershell
-python -m pip install -r requirements.txt
-python app.py
+`app.py` のあるフォルダで、OS に合ったコマンドを実行します。
+
+### macOS（ターミナル）
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python app.py
 ```
 
-ブラウザで http://127.0.0.1:8765 を開きます。画像フォルダの保存には Edge または Chrome を使用してください。停止するには起動した端末で Ctrl+C を押します。
+### Windows（PowerShell）
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
+```
+
+ブラウザで [http://127.0.0.1:8765](http://127.0.0.1:8765) を開きます。画像フォルダの保存には Edge または Chrome を使用してください。停止するには起動した端末で Ctrl+C を押します。
 
 ## 使い方
 
 1. PDFを画面にドラッグ＆ドロップするか、「PDFを選ぶ」を押します。画像は「画像フォルダを選ぶ」で開き、フォルダ内の相対パス順に並べます（例 `page2.png`、`page10.png`）。
 2. 検出が終わったページからプレビューできます。偶数ページの180°回転と検出された傾きを確認し、必要なページだけ調整します。「端の白塗りを調整」では、表示中の向きに合わせて上下左右の幅を入力できます。
-3. 「補正結果を保存」または Ctrl+S を押します。PDFの保存名はプレビュー上の「保存ファイル名」で変更できます。画像の場合は選択した保存先の下に新しいフォルダを作ります。
+3. 「補正結果を保存」または Ctrl+S（Mac は ⌘+S）を押します。PDFの保存名はプレビュー上の「保存ファイル名」で変更できます。画像の場合は選択した保存先の下に新しいフォルダを作ります。
 
 ノートPCでは「全体」表示でページを確認し、細部は `+` で拡大できます。左右キーで前後のページに移動し、`[` / `]` で角度を0.01°ずつ変えます。全ショートカットは画面上部の「キー操作」または `?` で確認できます。
 
