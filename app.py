@@ -15,6 +15,8 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_raw
 from PIL import Image, UnidentifiedImageError
 
+from score_geometry import analyse_notation
+
 FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
            ".tif": "TIFF", ".tiff": "TIFF", ".bmp": "BMP", ".webp": "WEBP"}
 # PDFium calls must be serialized even when requests open different documents.
@@ -40,7 +42,7 @@ def detect(image):
         if x == xx:
             continue
         angle = math.degrees(math.atan((yy - y) / (xx - x)))
-        if abs(angle) <= 10:
+        if abs(angle) <= 15:
             votes.setdefault(round(angle * 4), []).append((angle, abs(xx - x)))
     if not votes:
         return None
@@ -86,7 +88,7 @@ def refine_angle(image, estimate):
     coarse = max((estimate + step * 0.05 for step in range(-10, 11)), key=score)
     fine = max((coarse + step * 0.01 for step in range(-5, 6)), key=score)
     precise = max((fine + step * 0.001 for step in range(-10, 11)), key=score)
-    return round(precise, 3)
+    return round(max(-15, min(15, precise)), 3)
 
 
 def corrected(image, angle, flip, fit, margins=(0, 0, 0, 0)):
@@ -164,11 +166,12 @@ def read_pages(source, document, count, preview=False):
 
 
 def analyse_page(image):
-    angle = detect(image)
+    angle, flip, staff_lines = analyse_notation(image, detect(image))
     image.thumbnail((2000, 2000))
     preview = io.BytesIO()
     image.save(preview, "JPEG", quality=85)
-    return {"angle": angle, "preview": base64.b64encode(preview.getvalue()).decode()}
+    return {"angle": angle, "flip": flip, "staffLines": staff_lines,
+            "preview": base64.b64encode(preview.getvalue()).decode()}
 
 
 def export_settings(data, count):

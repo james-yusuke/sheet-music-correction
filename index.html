@@ -19,6 +19,7 @@ main{max-width:1700px}#workspace{grid-template-columns:205px minmax(0,1fr) 280px
 aside{max-height:none}.page-button{display:flex;gap:8px;align-items:center}.page-button img{width:40px;border:1px solid #d7dfd8}.page-button span{min-width:0}
 .page-button small{display:block;color:#455b50}.panel fieldset{margin:12px 0;padding:10px;border:1px solid #d7dfd8;border-radius:8px}.panel .actions{gap:7px}
 .panel input[type=number]{width:56px}.panel p{font-size:13px}.viewer{min-width:0}.views{grid-template-columns:minmax(0,1fr)}
+#angle{width:78px}
 .views[data-mode=split]{grid-template-columns:repeat(2,minmax(0,1fr))}
 .views[data-mode=after] #original,.views[data-mode=overlay] #original{display:none}
 #comparison{overflow:auto;max-height:78vh;background:#e0e6df;padding:12px;margin-top:12px;border-radius:8px}
@@ -47,6 +48,7 @@ main:has(#workspace:not([hidden])){padding-block:4px}
 .margin-fields input[type=number]{min-width:0;width:100%;max-width:65px}
 @media(max-width:480px){.margin-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .panel>.actions,#detection{margin-bottom:10px}
+#detection span{display:block}
 .panel details{margin-top:12px;padding-top:10px;border-top:1px solid #d7dfd8}
 .panel summary{cursor:pointer;color:#235745}
 .panel details .actions{margin-top:8px}
@@ -116,7 +118,7 @@ PDFをドロップ、またはクリックして選択
 <span id="position"></span><button type="submit">移動</button>
 </form>
 <button id="next">次へ</button>
-<button id="nextUndetected" hidden>傾き未検出へ</button>
+<button id="nextUndetected" hidden>要確認ページへ</button>
 </nav>
 <div id="previewControls" class="actions">
 <label>表示 <select id="mode">
@@ -168,12 +170,12 @@ PDFをドロップ、またはクリックして選択
 <h2 id="title"></h2>
 <div class="actions">
 <button id="less" aria-label="角度を0.01度減らす">−0.01°</button>
-<label>角度 <input id="angle" type="number" min="-15" max="15" step="0.001"> °</label>
+<label>補正角度 <input id="angle" type="number" min="-15" max="15" step="0.001"> °</label>
 <button id="more" aria-label="角度を0.01度増やす">+0.01°</button>
 <label><input id="flip" type="checkbox"> 180°回転</label>
 <button id="reset">このページを初期設定に戻す</button>
 </div>
-<p id="detection"></p>
+<p id="detection"><span id="detectedTilt"></span><span id="detectedOrientation"></span></p>
 <button id="resetAngle">角度を検出値に戻す</button>
 <div class="actions">
 <label><input id="fit" type="checkbox" checked> 縮小して端の欠けを防ぐ</label>
@@ -342,7 +344,7 @@ async function load(files, pdf) {
       ui.progress.max = total;
       ui.progress.value = result.length;
       const percent = Math.floor(result.length * 100 / total);
-      ui.status.textContent = '傾き検出中 · ' + result.length + ' / ' + total + 'ページ完了（' + percent + '%） · ' + inputLabel;
+      ui.status.textContent = '傾き・上下を検出中 · ' + result.length + ' / ' + total + 'ページ完了（' + percent + '%） · ' + inputLabel;
     }
     if (total) showProgress();
     for (const file of sources) {
@@ -360,7 +362,9 @@ async function load(files, pdf) {
         await image.decode();
         loading.signal.throwIfAborted();
         const index = result.length;
-        result.push({image, detected:info.angle, angle:info.angle ?? 0, flip:index % 2 === 1, margins:[0,0,0,0],
+        const detectedFlip = info.flip ?? null;
+        result.push({image, detected:info.angle, angle:info.angle ?? 0, detectedFlip,
+          flip:detectedFlip ?? false, staffLines:info.staffLines, margins:[0,0,0,0],
           name:pdf ? (index+1) + 'ページ' : path(file)});
         showProgress();
         if (index === 0) { ui.workspace.hidden = false; ui.dropZone.hidden = true; select(0); }
@@ -374,7 +378,11 @@ async function load(files, pdf) {
     rotationUndo = undefined;
     marginUndo = undefined;
     const skipped = files.length - sources.length;
-    ui.status.textContent = skipped ? '対応外のファイル ' + skipped + '件を除外しました。' : '';
+    const review = result.filter(needsReview).length;
+    ui.status.textContent = [
+      review ? '傾きまたは上下の確認が必要なページが ' + review + 'ページあります。' : '',
+      skipped ? '対応外のファイル ' + skipped + '件を除外しました。' : ''
+    ].filter(Boolean).join(' ');
   } catch (error) {
     ({sources,pages,active,isPdf,ready} = previous);
     setDirty(previous.dirty);
@@ -402,6 +410,8 @@ async function load(files, pdf) {
     }
   }
 }
+function needsReview(page) { return page.detected === null || page.detectedFlip === null; }
+function formatAngle(angle) { return (angle > 0 ? '+' : '') + angle.toFixed(3) + '°'; }
 function renderPages() {
   while (ui.pages.children.length > pages.length) ui.pages.lastElementChild.remove();
   pages.forEach((page,index) => {
@@ -426,11 +436,14 @@ function renderPages() {
     const labelText = isPdf ? page.name : (index + 1) + ' · ' + page.name.split('/').at(-1);
     if (text.textContent !== labelText) text.textContent = labelText;
     button.title = page.name;
-    badges.textContent = [page.flip && '180°', page.detected === null && '傾き要確認'].filter(Boolean).join(' · ');
+    badges.textContent = [
+      page.detected === null ? '傾き要確認' : formatAngle(page.detected),
+      page.flip && '180°', page.detectedFlip === null && '上下要確認'
+    ].filter(Boolean).join(' · ');
   });
   ui.prev.disabled = nextIndex(-1) === -1;
   ui.next.disabled = nextIndex(1) === -1;
-  ui.nextUndetected.hidden = !pages.some((page,index) => index !== active && page.detected === null);
+  ui.nextUndetected.hidden = !pages.some((page,index) => index !== active && needsReview(page));
   ui.position.textContent = importTotal > pages.length
     ? ' / ' + importTotal + 'ページ（' + pages.length + 'ページ読込済み）'
     : ' / ' + pages.length + 'ページ';
@@ -467,9 +480,15 @@ function select(index) {
   ui.resetAngle.disabled = page.angle === (page.detected ?? 0);
   ui.resetAngle.textContent = page.detected === null ? '角度を0°に戻す' : '角度を検出値に戻す';
   marginInputs.forEach((input,i) => { input.value = orientedMargins(page)[i]; });
-  ui.detection.textContent = page.detected === null
-    ? '傾きを検出できませんでした。必要に応じて角度を調整してください。'
-    : '検出した補正角度 ' + page.detected.toFixed(3) + '°';
+  if (page.detected === null) {
+    ui.detectedTilt.textContent = '傾きは要確認';
+  } else {
+    const direction = page.detected > 0 ? '（右下がり）' : page.detected < 0 ? '（右上がり）' : '';
+    const source = page.staffLines > 0 ? '五線の傾き ' : '水平線から推定した傾き ';
+    ui.detectedTilt.textContent = source + formatAngle(page.detected) + direction;
+  }
+  ui.detectedOrientation.textContent = page.detectedFlip === null ? '上下は要確認'
+    : page.detectedFlip ? '音部記号の判定 180°（上下逆）' : '音部記号の判定 0°（正立）';
   draw();
   fitPreviewHeight();
 }
@@ -776,7 +795,7 @@ ui.next.onclick = () => select(nextIndex(1));
 function nextUndetectedPage() {
   for (let offset = 1; offset < pages.length; offset++) {
     const index = (active + offset) % pages.length;
-    if (pages[index].detected === null) return index;
+    if (needsReview(pages[index])) return index;
   }
   return -1;
 }
@@ -886,7 +905,7 @@ ui.comparison.addEventListener('wheel', event => {
 }, {passive:false});
 ui.reset.onclick = () => {
   pages[active].angle = pages[active].detected ?? 0;
-  pages[active].flip = active % 2 === 1;
+  pages[active].flip = pages[active].detectedFlip ?? false;
   pages[active].margins = [0,0,0,0];
   changed(); select(active);
 };
