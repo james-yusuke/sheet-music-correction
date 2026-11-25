@@ -91,7 +91,19 @@ def refine_angle(image, estimate):
     return round(max(-15, min(15, precise)), 3)
 
 
-def corrected(image, angle, flip, fit, margins=(0, 0, 0, 0)):
+def reduce_bleed(image, strength):
+    if not strength:
+        return image
+    pixels = np.array(image.convert("RGB"))
+    cutoff = 255 - 1.55 * strength
+    brightness = (pixels[:, :, 0].astype(np.float32) * .299
+                  + pixels[:, :, 1] * .587 + pixels[:, :, 2] * .114)
+    pixels[brightness >= cutoff] = 255
+    return Image.fromarray(pixels)
+
+
+def corrected(image, angle, flip, fit, margins=(0, 0, 0, 0), vertical_angle=0, bleed=0):
+    image = reduce_bleed(image, bleed)
     if len(margins) != 4 or any(not 0 <= value <= 20 for value in margins):
         raise ValueError("端の白塗りは各辺0〜20%で指定してください")
     top, right, bottom, left = (
@@ -104,15 +116,24 @@ def corrected(image, angle, flip, fit, margins=(0, 0, 0, 0)):
         image.paste("white", box)
     if flip:
         image = image.transpose(Image.Transpose.ROTATE_180)
-    if not angle:
+    if not angle and not vertical_angle:
         return image
-    rotated = image.rotate(angle, Image.Resampling.BICUBIC, expand=fit, fillcolor="white")
-    if not fit:
-        return rotated
-    rotated.thumbnail(image.size, Image.Resampling.LANCZOS)
-    canvas = Image.new("RGB", image.size, "white")
-    canvas.paste(rotated, ((image.width-rotated.width)//2, (image.height-rotated.height)//2))
-    return canvas
+
+    # Level the staffs first, then shear horizontally to straighten the barlines.
+    sine, cosine = math.sin(math.radians(angle)), math.cos(math.radians(angle))
+    lean = math.tan(math.radians(vertical_angle))
+    xx, xy = cosine + lean * sine, sine - lean * cosine
+    yx, yy = -sine, cosine
+    scale = min(1, width / (abs(xx) * width + abs(xy) * height),
+                height / (abs(yx) * width + abs(yy) * height)) if fit else 1
+
+    # Pillow samples from the inverse of this centered transform.
+    a, b = yy / scale, -xy / scale
+    d, e = -yx / scale, xx / scale
+    cx, cy = width / 2, height / 2
+    inverse = (a, b, cx - a * cx - b * cy, d, e, cy - d * cx - e * cy)
+    return image.transform(image.size, Image.Transform.AFFINE, inverse,
+                           Image.Resampling.BICUBIC, fillcolor="white")
 
 
 @contextmanager
@@ -166,11 +187,12 @@ def read_pages(source, document, count, preview=False):
 
 
 def analyse_page(image):
-    angle, flip, staff_lines = analyse_notation(image, detect(image))
+    notation = analyse_notation(image, detect(image))
     image.thumbnail((2000, 2000))
     preview = io.BytesIO()
     image.save(preview, "JPEG", quality=85)
-    return {"angle": angle, "flip": flip, "staffLines": staff_lines,
+    return {"angle": notation.angle, "verticalAngle": notation.vertical_angle,
+            "flip": notation.flip, "staffLines": notation.staff_lines,
             "preview": base64.b64encode(preview.getvalue()).decode()}
 
 
@@ -179,19 +201,24 @@ def export_settings(data, count):
     if not isinstance(settings, list) or len(settings) != count:
         raise ValueError("ページ設定の数が一致しません")
     for page in settings:
-        if not isinstance(page, list) or len(page) not in (3, 4):
+        if not isinstance(page, list) or len(page) not in (3, 4, 5, 6):
             raise ValueError("ページ設定の形式が無効です")
         angle, flip, fit = page[:3]
-        margins = page[3] if len(page) == 4 else [0, 0, 0, 0]
-        if type(angle) not in (int, float) or not -15 <= angle <= 15:
-            raise ValueError("角度は±15°以内で指定してください")
+        margins = page[3] if len(page) >= 4 else [0, 0, 0, 0]
+        vertical_angle = page[4] if len(page) >= 5 else 0
+        bleed = page[5] if len(page) == 6 else 0
+        if type(bleed) not in (int, float) or not 0 <= bleed <= 100:
+            raise ValueError("裏写り補正は0〜100で指定してください")
+        if any(type(value) not in (int, float) or not -15 <= value <= 15
+               for value in (angle, vertical_angle)):
+            raise ValueError("補正角度は±15°以内で指定してください")
         if type(flip) is not bool or type(fit) is not bool:
             raise ValueError("回転・縮小の設定が無効です")
         if not isinstance(margins, list) or len(margins) != 4 or any(
             type(value) not in (int, float) or not 0 <= value <= 20 for value in margins
         ):
             raise ValueError("端の白塗りは各辺0〜20%で指定してください")
-        yield angle, flip, fit, margins
+        yield angle, flip, fit, margins, vertical_angle, bleed
 
 
 def write_pdf(output, count, pages):

@@ -16,13 +16,49 @@ class Staff(NamedTuple):
     spacing: float
 
 
+class Notation(NamedTuple):
+    angle: float | None
+    vertical_angle: float | None
+    flip: bool | None
+    staff_lines: int
+
+
 def analyse_notation(image, initial_angle):
-    """Measure the staff angle and use clefs to identify a 180° rotation."""
+    """Identify the page orientation, then measure corrections on the upright score."""
     gray = image.convert("L")
     gray.thumbnail((2400, 2400), Image.Resampling.BOX)
+    seed = initial_angle if initial_angle is not None else 0
+    level, ink, horizontal, staffs = staff_geometry(gray, seed)
+    if not staffs:
+        return Notation(initial_angle, None, None, 0)
+
+    flip = detect_flip(ink, staffs, 0)
+    if flip is None:
+        # A strong vertical lean can obscure the clef shape. Compensate in the
+        # orientation check before measuring the corrections to apply.
+        lean_angle = measure_barline_angle(level, staffs)
+        if lean_angle:
+            flip = detect_flip(ink, staffs, math.tan(math.radians(lean_angle)))
+    if flip:
+        upright = gray.transpose(Image.Transpose.ROTATE_180)
+        level, _, horizontal, staffs = staff_geometry(upright, seed)
+
+    slopes = staff_line_angles(horizontal, staffs)
+    angle = round(float(np.clip(seed + np.median(slopes), -15, 15)), 3) if slopes else initial_angle
+    barline_angle = measure_barline_angle(level, staffs) if staffs and angle is not None else None
+    vertical_angle = None
+    if barline_angle is not None:
+        # The barlines were measured using the coarse rotation. Express their lean
+        # relative to the refined horizontal rotation that will actually be applied.
+        corrected_reference = round(float(barline_angle + angle - seed), 3)
+        if abs(corrected_reference) <= 15:
+            vertical_angle = corrected_reference
+    return Notation(angle, vertical_angle, flip, len(slopes))
+
+
+def staff_geometry(gray, seed):
     width, height = gray.size
-    angle = initial_angle if initial_angle is not None else 0
-    rotation = cv2.getRotationMatrix2D(((width - 1) / 2, (height - 1) / 2), angle, 1)
+    rotation = cv2.getRotationMatrix2D(((width - 1) / 2, (height - 1) / 2), seed, 1)
     level = cv2.warpAffine(np.asarray(gray), rotation, gray.size, borderValue=255)
     ink = cv2.adaptiveThreshold(level, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                 cv2.THRESH_BINARY_INV, 35, 13)
@@ -30,16 +66,7 @@ def analyse_notation(image, initial_angle):
     line_ink = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(14, width // 8), 1))
     horizontal = cv2.morphologyEx(line_ink, cv2.MORPH_OPEN, kernel)
-    staffs = find_staffs(horizontal)
-    if not staffs:
-        return initial_angle, None, 0
-
-    slopes = staff_line_angles(horizontal, staffs)
-    if slopes:
-        angle = round(float(np.clip(angle + np.median(slopes), -15, 15)), 3)
-    else:
-        angle = initial_angle
-    return angle, detect_flip(ink, staffs), len(slopes)
+    return level, ink, horizontal, find_staffs(horizontal)
 
 
 def find_staffs(horizontal):
@@ -97,6 +124,70 @@ def staff_line_angles(horizontal, staffs):
     return angles
 
 
+def measure_barline_angle(level, staffs):
+    dx = cv2.Sobel(level, cv2.CV_16S, 1, 0)
+    dy = cv2.Sobel(level, cv2.CV_16S, 0, 1)
+    edges = cv2.Canny(level, 45, 125)
+    edges[np.abs(dx) <= np.abs(dy)] = 0
+    spacing = float(np.median([staff.spacing for staff in staffs]))
+    segments = cv2.HoughLinesP(edges, 1, np.pi / 720, max(12, round(2.5 * spacing)),
+                               minLineLength=max(12, round(3.4 * spacing)),
+                               maxLineGap=max(3, round(0.65 * spacing)))
+    if segments is None:
+        return None
+
+    candidates = []
+    for x1, y1, x2, y2 in segments.reshape(-1, 4).tolist():
+        if y1 > y2:
+            x1, x2, y1, y2 = x2, x1, y2, y1
+        span = y2 - y1
+        if not span or abs(x2 - x1) > 0.30 * span:
+            continue
+        slope = (x2 - x1) / span
+        # A barline crosses nearly the full staff. Exclude the outer edges where
+        # binding marks and borders can look like measure bars.
+        if not any(y1 <= top + 0.4 * space and y2 >= top + 3.6 * space
+                   and left + 2 * space < x1 + (top + 2 * space - y1) * slope < right - 2 * space
+                   for left, right, top, space in staffs):
+            continue
+        refined = refine_barline(dx, x1, y1, y2, slope)
+        if refined is not None:
+            angle, column = refined
+            candidates.append((angle, min(span, 300), column))
+
+    if len(candidates) < 3:
+        return None
+    angles, weights, columns = np.array(sorted(candidates)).T
+    cumulative = np.cumsum(weights)
+    median = angles[np.searchsorted(cumulative, cumulative[-1] / 2)]
+    agreement = np.abs(angles - median) <= 0.75
+    if weights[agreement].sum() < cumulative[-1] * 0.65 or np.ptp(columns[agreement]) < spacing:
+        return None
+    return float(median)
+
+
+def refine_barline(gradient, x, first_row, last_row, slope):
+    rows = np.arange(first_row, last_row + 1)
+    centers = np.rint(x + (rows - first_row) * slope).astype(int)
+    columns = np.clip(centers[:, None] + np.arange(-2, 3), 0, gradient.shape[1] - 1)
+    samples = gradient[rows[:, None], columns]
+    # Follow one edge of the same stroke with subpixel centers of the gradient.
+    sign = 1 if samples.sum() > 0 else -1
+    weights = np.maximum(sign * samples - 40, 0)
+    totals = weights.sum(axis=1)
+    valid = totals > 80
+    if np.count_nonzero(valid) < len(rows) * 0.65:
+        return None
+    positions = (weights[valid] * columns[valid]).sum(axis=1) / totals[valid]
+    points = np.column_stack((rows[valid], positions)).astype(np.float32)
+    vy, vx, _, _ = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).ravel()
+    angle = math.degrees(math.atan2(vx, vy))
+    if abs(angle) > 15:
+        return None
+    column = np.mean(positions - (rows[valid] - gradient.shape[0] / 2) * (vx / vy))
+    return angle, float(column)
+
+
 # The three cells contain G, F and C clefs rendered from Bravura at this scale.
 STAFF_SPACE = 24
 
@@ -120,10 +211,12 @@ def clef_templates():
         return templates
 
 
-def clef_score(ink, staff):
+def clef_score(ink, staff, lean):
     left, _, top, spacing = staff
     scale = spacing / STAFF_SPACE
-    transform = np.float32([[scale, 0, left - spacing], [0, scale, top - 3 * spacing]])
+    # Sample a straightened clef around the midpoint of the tilted staff edge.
+    transform = np.float32([[scale, scale * lean, left - (1 + 5 * lean) * spacing],
+                            [0, scale, top - 3 * spacing]])
     strip = cv2.warpAffine(ink, transform, (5 * STAFF_SPACE, 10 * STAFF_SPACE),
                            flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR)
     best = 0.0
@@ -134,14 +227,14 @@ def clef_score(ink, staff):
     return best
 
 
-def detect_flip(ink, staffs):
+def detect_flip(ink, staffs, lean):
     height, width = ink.shape
     turned = cv2.rotate(ink, cv2.ROTATE_180)
     upright, upside_down = [], []
     for left, right, top, spacing in staffs:
-        normal = clef_score(ink, Staff(left, right, top, spacing))
+        normal = clef_score(ink, Staff(left, right, top, spacing), lean)
         rotated = clef_score(turned, Staff(width - right, width - left,
-                                          height - 1 - top - 4 * spacing, spacing))
+                                          height - 1 - top - 4 * spacing, spacing), lean)
         if normal >= 0.75 and normal - rotated >= 0.12:
             upright.append(normal)
         elif rotated >= 0.75 and rotated - normal >= 0.12:

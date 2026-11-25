@@ -19,7 +19,7 @@ main{max-width:1700px}#workspace{grid-template-columns:205px minmax(0,1fr) 280px
 aside{max-height:none}.page-button{display:flex;gap:8px;align-items:center}.page-button img{width:40px;border:1px solid #d7dfd8}.page-button span{min-width:0}
 .page-button small{display:block;color:#455b50}.panel fieldset{margin:12px 0;padding:10px;border:1px solid #d7dfd8;border-radius:8px}.panel .actions{gap:7px}
 .panel input[type=number]{width:56px}.panel p{font-size:13px}.viewer{min-width:0}.views{grid-template-columns:minmax(0,1fr)}
-#angle{width:78px}
+#angle,#verticalAngle{width:78px}
 .views[data-mode=split]{grid-template-columns:repeat(2,minmax(0,1fr))}
 .views[data-mode=after] #original,.views[data-mode=overlay] #original{display:none}
 #comparison{overflow:auto;max-height:78vh;background:#e0e6df;padding:12px;margin-top:12px;border-radius:8px}
@@ -169,14 +169,19 @@ PDFをドロップ、またはクリックして選択
 </details>
 <h2 id="title"></h2>
 <div class="actions">
+<label>五線の補正角度 <input id="angle" type="number" min="-15" max="15" step="0.001"> °</label>
+<div class="actions" role="group" aria-label="五線の角度を微調整">
 <button id="less" aria-label="角度を0.01度減らす">−0.01°</button>
-<label>補正角度 <input id="angle" type="number" min="-15" max="15" step="0.001"> °</label>
 <button id="more" aria-label="角度を0.01度増やす">+0.01°</button>
+</div>
+<label>小節線の補正角度 <input id="verticalAngle" type="number" min="-15" max="15" step="0.001"> °</label>
 <label><input id="flip" type="checkbox"> 180°回転</label>
+<label id="tiltOnFlipOption" hidden><input id="tiltOnFlip" type="checkbox"> 傾きも補正</label>
 <button id="reset">このページを初期設定に戻す</button>
 </div>
-<p id="detection"><span id="detectedTilt"></span><span id="detectedOrientation"></span></p>
-<button id="resetAngle">角度を検出値に戻す</button>
+<p id="detection"><span id="detectedTilt"></span><span id="detectedBarline"></span><span id="detectedOrientation"></span></p>
+<fieldset><legend>裏写り補正</legend><label>強さ <input id="bleed" type="range" min="0" max="100" value="0"></label><output id="bleedValue">0</output><button id="applyBleed" type="button">全ページに適用</button><p>設定した明るさ以上の薄い部分を、すべて白く消します。強さを上げると、より濃い部分まで消せます。</p></fieldset>
+<button id="resetAngle">傾きを検出値に戻す</button>
 <div class="actions">
 <label><input id="fit" type="checkbox" checked> 縮小して端の欠けを防ぐ</label>
 </div>
@@ -185,7 +190,7 @@ PDFをドロップ、またはクリックして選択
 <div class="actions">
 <label>対象 <select id="rotationPattern">
 <option value="even">偶数ページ</option>
-<option value="odd">奇数ページ</option>
+<option value="odd" selected>奇数ページ</option>
 <option value="all">すべて</option>
 <option value="none">なし</option>
 </select></label>
@@ -344,7 +349,7 @@ async function load(files, pdf) {
       ui.progress.max = total;
       ui.progress.value = result.length;
       const percent = Math.floor(result.length * 100 / total);
-      ui.status.textContent = '傾き・上下を検出中 · ' + result.length + ' / ' + total + 'ページ完了（' + percent + '%） · ' + inputLabel;
+      ui.status.textContent = '上下と傾きを検出中 · ' + result.length + ' / ' + total + 'ページ完了（' + percent + '%） · ' + inputLabel;
     }
     if (total) showProgress();
     for (const file of sources) {
@@ -363,8 +368,10 @@ async function load(files, pdf) {
         loading.signal.throwIfAborted();
         const index = result.length;
         const detectedFlip = info.flip ?? null;
-        result.push({image, detected:info.angle, angle:info.angle ?? 0, detectedFlip,
-          flip:detectedFlip ?? false, staffLines:info.staffLines, margins:[0,0,0,0],
+        const detectedVertical = info.verticalAngle ?? null;
+        result.push({image, detected:info.angle, angle:info.angle ?? 0,
+          detectedVertical, verticalAngle:detectedVertical ?? 0, detectedFlip,
+          flip:index % 2 === 0, bleed:0, tiltOnFlip:true, staffLines:info.staffLines, margins:[0,0,0,0],
           name:pdf ? (index+1) + 'ページ' : path(file)});
         showProgress();
         if (index === 0) { ui.workspace.hidden = false; ui.dropZone.hidden = true; select(0); }
@@ -410,7 +417,10 @@ async function load(files, pdf) {
     }
   }
 }
-function needsReview(page) { return page.detected === null || page.detectedFlip === null; }
+function needsReview(page) {
+  return page.detected === null || page.detectedVertical === null || page.detectedFlip === null;
+}
+function useTilt(page) { return !page.flip || page.tiltOnFlip; }
 function formatAngle(angle) { return (angle > 0 ? '+' : '') + angle.toFixed(3) + '°'; }
 function renderPages() {
   while (ui.pages.children.length > pages.length) ui.pages.lastElementChild.remove();
@@ -438,6 +448,7 @@ function renderPages() {
     button.title = page.name;
     badges.textContent = [
       page.detected === null ? '傾き要確認' : formatAngle(page.detected),
+      page.detectedVertical === null && '小節線要確認',
       page.flip && '180°', page.detectedFlip === null && '上下要確認'
     ].filter(Boolean).join(' · ');
   });
@@ -476,9 +487,9 @@ function select(index) {
   else if (row.bottom > viewport.bottom) list.scrollTop += row.bottom - viewport.bottom;
   ui.title.textContent = page.name;
   ui.title.title = page.name;
-  ui.angle.value = page.angle; ui.flip.checked = page.flip;
-  ui.resetAngle.disabled = page.angle === (page.detected ?? 0);
-  ui.resetAngle.textContent = page.detected === null ? '角度を0°に戻す' : '角度を検出値に戻す';
+  ui.bleed.value = page.bleed; ui.bleedValue.value = page.bleed;
+  ui.angle.value = page.angle; ui.verticalAngle.value = page.verticalAngle; ui.flip.checked = page.flip;
+  updateTiltControls(page);
   marginInputs.forEach((input,i) => { input.value = orientedMargins(page)[i]; });
   if (page.detected === null) {
     ui.detectedTilt.textContent = '傾きは要確認';
@@ -487,24 +498,69 @@ function select(index) {
     const source = page.staffLines > 0 ? '五線の傾き ' : '水平線から推定した傾き ';
     ui.detectedTilt.textContent = source + formatAngle(page.detected) + direction;
   }
-  ui.detectedOrientation.textContent = page.detectedFlip === null ? '上下は要確認'
-    : page.detectedFlip ? '音部記号の判定 180°（上下逆）' : '音部記号の判定 0°（正立）';
+  ui.detectedBarline.textContent = page.detectedVertical === null ? '小節線の傾きは要確認'
+    : '小節線の傾き ' + formatAngle(page.detectedVertical) + '（五線を水平にした後）';
+  ui.detectedOrientation.textContent = '初期回転設定：奇数ページ180°・偶数ページ0°';
   draw();
   fitPreviewHeight();
 }
+function updateTiltControls(page) {
+  const enabled = useTilt(page);
+  ui.tiltOnFlipOption.hidden = !page.flip;
+  ui.tiltOnFlip.checked = page.tiltOnFlip;
+  ui.angle.disabled = ui.verticalAngle.disabled = ui.less.disabled = ui.more.disabled = !enabled;
+  ui.resetAngle.disabled = !enabled || (page.angle === (page.detected ?? 0) &&
+    page.verticalAngle === (page.detectedVertical ?? 0));
+}
+function bleedSource(page) {
+  if (!page.bleed) return page.image;
+  if (page.bleedCanvas && page.bleedLevel === page.bleed) return page.bleedCanvas;
+  const canvas = document.createElement('canvas');
+  canvas.width = page.image.width; canvas.height = page.image.height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(page.image,0,0);
+  const data = ctx.getImageData(0,0,canvas.width,canvas.height);
+  const cutoff = 255 - 1.55 * page.bleed;
+  for (let i=0; i<data.data.length; i+=4) {
+    const brightness = data.data[i]*0.299 + data.data[i+1]*0.587 + data.data[i+2]*0.114;
+    if (brightness >= cutoff) {
+      data.data[i] = data.data[i+1] = data.data[i+2] = 255;
+    }
+  }
+  ctx.putImageData(data,0,0);
+  page.bleedCanvas = canvas; page.bleedLevel = page.bleed;
+  return canvas;
+}
+ui.bleed.oninput = () => {
+  pages[active].bleed = Number(ui.bleed.value);
+  ui.bleedValue.value = ui.bleed.value;
+  changed();
+};
+ui.applyBleed.onclick = () => {
+  const strength = pages[active].bleed;
+  pages.forEach(page => { page.bleed = strength; delete page.thumbnail; delete page.bleedCanvas; });
+  changed();
+};
 function paint(canvas,page,w,h) {
   canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = 'white'; ctx.fillRect(0,0,w,h);
   ctx.translate(w/2,h/2);
-  const rad = -page.angle * Math.PI / 180;
+  const tilt = useTilt(page);
+  const radians = Math.PI / 180;
+  const angle = tilt ? page.angle * radians : 0;
+  const lean = tilt ? Math.tan(page.verticalAngle * radians) : 0;
+  const sine = Math.sin(angle), cosine = Math.cos(angle);
+  const xx = cosine + lean*sine, xy = sine - lean*cosine;
+  const yx = -sine, yy = cosine;
   if (ui.fit.checked) {
-    const c = Math.abs(Math.cos(rad)), s = Math.abs(Math.sin(rad));
-    const scale = Math.min(w/(w*c+h*s),h/(w*s+h*c),1);
+    const scale = Math.min(1,w/(Math.abs(xx)*w+Math.abs(xy)*h),h/(Math.abs(yx)*w+Math.abs(yy)*h));
     ctx.scale(scale,scale);
   }
-  ctx.rotate(rad + (page.flip ? Math.PI : 0));
-  ctx.drawImage(page.image,-w/2,-h/2,w,h);
+  ctx.transform(xx,yx,xy,yy,0,0);
+  // The source is turned before the tilt transform above is applied.
+  if (page.flip) ctx.scale(-1,-1);
+  ctx.drawImage(bleedSource(page),-w/2,-h/2,w,h);
   const [top,right,bottom,left] = page.margins.map((value,i) => value*(i%2 ? w : h)/100);
   ctx.fillRect(-w/2,-h/2,w,top);
   ctx.fillRect(w/2-right,-h/2,right,h);
@@ -522,7 +578,7 @@ function nextIndex(step) {
   return next >= 0 && next < pages.length ? next : -1;
 }
 function changed(page = pages[active]) {
-  ui.resetAngle.disabled = page.angle === (page.detected ?? 0);
+  updateTiltControls(page);
   setDirty(true);
   delete page.thumbnail;
   renderPages();
@@ -634,7 +690,10 @@ ui.save.onclick = async () => {
   busy(true);
   ui.workspace.inert = true;
   ui.save.textContent = '保存中…';
-  const settings = pages.map(p => [p.angle,p.flip,ui.fit.checked,[...p.margins]]);
+  const settings = pages.map(page => {
+    const tilt = useTilt(page);
+    return [tilt ? page.angle : 0,page.flip,ui.fit.checked,[...page.margins],tilt ? page.verticalAngle : 0,page.bleed];
+  });
   try {
     if (isPdf) {
       ui.status.textContent = 'PDFを書き出しています…';
@@ -733,13 +792,26 @@ document.addEventListener('drop', event => {
   load(files,true);
 });
 ui.folder.onchange = () => load(Array.from(ui.folder.files),false);
-ui.angle.oninput = () => {
-  if (ui.angle.value !== '' && ui.angle.validity.rangeOverflow === false && ui.angle.validity.rangeUnderflow === false) {
-    pages[active].angle = ui.angle.valueAsNumber; changed();
-  }
+for (const [input,key] of [[ui.angle,'angle'],[ui.verticalAngle,'verticalAngle']]) {
+  input.oninput = () => {
+    const value = input.valueAsNumber;
+    if (value >= -15 && value <= 15) {
+      pages[active][key] = value;
+      changed();
+    }
+  };
+  input.onchange = () => { input.value = pages[active][key]; };
+}
+ui.flip.onchange = () => {
+  const page = pages[active];
+  page.flip = ui.flip.checked;
+  page.tiltOnFlip = true;
+  changed(); select(active);
 };
-ui.angle.onchange = () => { ui.angle.value = pages[active].angle; };
-ui.flip.onchange = () => { pages[active].flip = ui.flip.checked; changed(); select(active); };
+ui.tiltOnFlip.onchange = () => {
+  pages[active].tiltOnFlip = ui.tiltOnFlip.checked;
+  changed();
+};
 ui.fit.onchange = () => {
   setDirty(true);
   pages.forEach(page => { delete page.thumbnail; });
@@ -828,7 +900,9 @@ ui.less.onclick = () => nudge(-0.01);
 ui.resetAngle.onclick = () => {
   const page = pages[active];
   page.angle = page.detected ?? 0;
+  page.verticalAngle = page.detectedVertical ?? 0;
   ui.angle.value = page.angle;
+  ui.verticalAngle.value = page.verticalAngle;
   changed();
 };
 ui.more.onclick = () => nudge(0.01);
@@ -904,9 +978,13 @@ ui.comparison.addEventListener('wheel', event => {
   changeZoom(currentZoom() * Math.exp(change), event.clientX, event.clientY);
 }, {passive:false});
 ui.reset.onclick = () => {
-  pages[active].angle = pages[active].detected ?? 0;
-  pages[active].flip = pages[active].detectedFlip ?? false;
-  pages[active].margins = [0,0,0,0];
+  const page = pages[active];
+  page.angle = page.detected ?? 0;
+  page.verticalAngle = page.detectedVertical ?? 0;
+  page.flip = active % 2 === 0;
+  page.bleed = 0;
+  page.tiltOnFlip = true;
+  page.margins = [0,0,0,0];
   changed(); select(active);
 };
 function rotationForPage(pattern,index) {
@@ -917,22 +995,25 @@ ui.even.onclick = () => {
   const pattern = ui.rotationPattern.value;
   const changes = pages.filter((page,index) => page.flip !== rotationForPage(pattern,index));
   if (!changes.length || !confirm(changes.length + 'ページの180°回転設定を変更しますか？')) return;
-  rotationUndo = pages.map((page,index) => ({page, before:page.flip, after:rotationForPage(pattern,index)}))
+  rotationUndo = pages.map((page,index) => ({page, before:page.flip, beforeTilt:page.tiltOnFlip,
+    after:rotationForPage(pattern,index)}))
     .filter(({before,after}) => before !== after);
   ui.undoRotation.disabled = false;
   pages.forEach((page,index) => {
     const flip = rotationForPage(pattern,index);
     if (page.flip === flip) return;
     page.flip = flip;
+    page.tiltOnFlip = true;
     delete page.thumbnail;
   });
   setDirty(true);
   select(active);
 };
 ui.undoRotation.onclick = () => {
-  for (const {page,before,after} of rotationUndo) {
+  for (const {page,before,beforeTilt,after} of rotationUndo) {
     if (page.flip !== after) continue;
     page.flip = before;
+    page.tiltOnFlip = beforeTilt;
     delete page.thumbnail;
   }
   rotationUndo = undefined;
